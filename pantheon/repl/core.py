@@ -371,8 +371,9 @@ class Repl(ReplUI):
                             self._status_update_task = None
                         
                         self.prompt_app.stop_processing()
-                        # Final update after processing
-                        await self._update_status_bar_token_usage()
+                        # Final update after processing: use accurate full calculation
+                        # so idle ctx: display matches /tokens output
+                        await self._update_status_bar_accurate()
                     self.message_queue.task_done()
                     
             except asyncio.CancelledError:
@@ -605,13 +606,10 @@ class Repl(ReplUI):
 
                             # Update status bar
                             self.prompt_app.update_token_usage(usage_pct, total_cost)
-                        # else: no valid metadata (e.g., after compression) — keep
-                        # existing status bar values to avoid overwriting a more
-                        # accurate estimate set by _handle_compress
+                        # else: no valid metadata (e.g., after compression) — fall through to accurate path
                         return
-            return
-            
-            # Fallback: Use detailed stats if fast path fails
+
+            # Fallback: Use detailed stats if fast path fails (e.g., no metadata found)
             from .utils import get_detailed_token_stats
             fallback = {
                 "total_input_tokens": self.total_input_tokens,
@@ -624,10 +622,34 @@ class Repl(ReplUI):
             usage_pct = token_info.get("usage_percent", 0)
             total_cost = token_info.get("total_cost") or 0.0
             self.prompt_app.update_token_usage(usage_pct, total_cost)
-            
+
         except Exception:
             pass  # Silently ignore errors
 
+
+    async def _update_status_bar_accurate(self):
+        """Accurate status bar update using full token calculation (same as /tokens).
+
+        Called once after processing completes so the idle display matches /tokens.
+        Slower than _update_status_bar_token_usage but gives the correct value.
+        """
+        if not self.prompt_app:
+            return
+        try:
+            from .utils import get_detailed_token_stats
+            fallback = {
+                "total_input_tokens": self.total_input_tokens,
+                "total_output_tokens": self.total_output_tokens,
+                "message_count": self.message_count,
+            }
+            token_info = await get_detailed_token_stats(
+                self._chatroom, self._chat_id, self._team, fallback
+            )
+            usage_pct = token_info.get("usage_percent", 0)
+            total_cost = token_info.get("total_cost") or 0.0
+            self.prompt_app.update_token_usage(usage_pct, total_cost)
+        except Exception:
+            pass  # Silently ignore errors
 
     async def _status_update_loop(self):
         """Background loop for real-time status bar updates.
@@ -1032,6 +1054,12 @@ class Repl(ReplUI):
         elif cmd_lower == "/keys" or cmd_lower.startswith("/keys "):
             args = cmd[5:].strip()
             self._handle_keys_command(args)
+            return
+
+        # OAuth command
+        elif cmd_lower.startswith("/oauth"):
+            args = cmd[7:].strip()  # Handles both "/oauth" and "/oauth login"
+            await self._handle_oauth_command(args)
             return
 
         # Verbose mode command
@@ -2215,6 +2243,213 @@ class Repl(ReplUI):
             os.environ[env_var] = api_key
             reset_model_selector()
             self.console.print(f"[green]\u2713[/green] {display_name} ({env_var}) saved to ~/.pantheon/.env")
+
+    async def _handle_oauth_command(self, args: str):
+        """Handle /oauth command - manage OAuth authentication.
+
+        Usage:
+            /oauth login [provider]      - Start OAuth login flow (default: openai)
+            /oauth status [provider]     - Show OAuth authentication status
+            /oauth logout [provider]     - Clear OAuth credentials
+            /oauth import-codex          - Import authentication from Codex CLI
+            /oauth prefs                 - Show API key/OAuth routing preferences
+            /oauth mode <mode>           - Set auth mode
+            /oauth enable <api-key|oauth>
+            /oauth disable <api-key|oauth>
+        """
+        from pantheon.auth.oauth_manager import get_oauth_manager
+        from pantheon.auth.openai_auth_strategy import (
+            VALID_OPENAI_AUTH_MODES,
+        )
+        from pantheon.repl.setup_wizard import (
+            _save_openai_auth_settings_to_settings,
+            get_openai_auth_summary_state,
+        )
+        from pantheon.settings import get_settings
+        import asyncio
+        import os
+
+        parts = args.lower().strip().split() if args else []
+        subcommand = parts[0] if parts else "status"
+        provider = parts[1] if len(parts) > 1 else None
+
+        oauth_manager = get_oauth_manager()
+
+        if subcommand == "list":
+            self.console.print()
+            self.console.print("[bold]Available OAuth Providers[/bold]")
+            self.console.print()
+
+            providers = oauth_manager.list_providers()
+            default_provider = oauth_manager.default_provider
+
+            for p in providers:
+                marker = " (default)" if p == default_provider else ""
+                self.console.print(f"  • {p}{marker}")
+
+            self.console.print()
+            self.console.print("[dim]Usage: /oauth login <provider>[/dim]")
+            self.console.print()
+
+        elif subcommand == "login":
+            self.console.print()
+            provider_name = provider or "openai"
+            self.console.print(f"[bold]{provider_name.title()} OAuth Login[/bold]")
+            self.console.print("[dim]A browser window will open for you to authenticate.[/dim]")
+            self.console.print()
+
+            try:
+                loop = asyncio.get_event_loop()
+                success = await loop.run_in_executor(
+                    None,
+                    lambda: oauth_manager.login(provider)
+                )
+
+                if success:
+                    status = oauth_manager.get_status(provider)
+                    self.console.print(f"[green]✓ {provider_name.title()} OAuth login successful![/green]")
+                    self.console.print("[dim]This logs in your OpenAI account, but does not replace OPENAI_API_KEY for OpenAI API model calls.[/dim]")
+                    if status.email:
+                        self.console.print(f"  Email: {status.email}")
+                    if status.organization_id:
+                        self.console.print(f"  Organization ID: {status.organization_id}")
+                    if status.project_id:
+                        self.console.print(f"  Project ID: {status.project_id}")
+                    self.console.print()
+                else:
+                    self.console.print(f"[red]✗ {provider_name.title()} OAuth login failed[/red]")
+                    self.console.print("[dim]Please try again or check your internet connection.[/dim]")
+                    self.console.print()
+            except Exception as e:
+                self.console.print(f"[red]✗ OAuth login error: {e}[/red]")
+                self.console.print()
+
+        elif subcommand == "status":
+            self.console.print()
+            provider_name = provider or oauth_manager.default_provider
+            self.console.print(f"[bold]{provider_name.title()} OAuth Status[/bold]")
+            self.console.print()
+
+            try:
+                status = oauth_manager.get_status(provider)
+
+                if status.authenticated:
+                    self.console.print("[green]✓ Authenticated[/green]")
+                    if status.email:
+                        self.console.print(f"  Email: {status.email}")
+                    if status.organization_id:
+                        self.console.print(f"  Organization: {status.organization_id}")
+                    if status.project_id:
+                        self.console.print(f"  Project: {status.project_id}")
+                    if status.token_expires_at:
+                        self.console.print(f"  Token Expires: {status.token_expires_at}")
+                else:
+                    self.console.print("[yellow]Not authenticated[/yellow]")
+                    self.console.print("[dim]Use '/oauth login openai' to authenticate.[/dim]")
+                self.console.print()
+            except Exception as e:
+                self.console.print(f"[red]✗ Failed to get OAuth status: {e}[/red]")
+                self.console.print()
+
+        elif subcommand == "logout":
+            self.console.print()
+            provider_name = provider or oauth_manager.default_provider
+            self.console.print(f"[bold]{provider_name.title()} OAuth Logout[/bold]")
+            self.console.print()
+
+            try:
+                oauth_manager.logout(provider)
+                self.console.print(f"[green]✓ {provider_name.title()} OAuth credentials cleared[/green]")
+                self.console.print("[dim]Use '/oauth login openai' to authenticate again.[/dim]")
+                self.console.print()
+            except Exception as e:
+                self.console.print(f"[red]✗ Failed to logout: {e}[/red]")
+                self.console.print()
+
+        elif subcommand == "import-codex":
+            self.console.print()
+            self.console.print("[bold]Import from Codex CLI[/bold]")
+            self.console.print("[dim]Reading existing Codex CLI authentication...[/dim]")
+            self.console.print()
+
+            try:
+                from pantheon.auth.openai_provider import import_from_codex_cli
+                success = import_from_codex_cli()
+
+                if success:
+                    status = oauth_manager.get_status("openai")
+                    self.console.print("[green]✓ Successfully imported Codex CLI authentication![/green]")
+                    self.console.print("[dim]Imported OAuth credentials are kept for account login/status only, not used as an OpenAI API key.[/dim]")
+                    if status.email:
+                        self.console.print(f"  Email: {status.email}")
+                    self.console.print()
+                    self.console.print("[dim]You can now manage the linked OpenAI account from PantheonOS.[/dim]")
+                    self.console.print()
+                else:
+                    self.console.print("[red]✗ Failed to import Codex CLI authentication[/red]")
+                    self.console.print("[dim]Make sure you have run 'codex login' first.[/dim]")
+                    self.console.print()
+            except Exception as e:
+                self.console.print(f"[red]✗ Import error: {e}[/red]")
+                self.console.print()
+
+        elif subcommand == "prefs":
+            self.console.print()
+            self.console.print("[bold]OpenAI Authentication Preferences[/bold]")
+            self.console.print()
+            state = get_openai_auth_summary_state()
+            self.console.print(f"  Mode: {state['mode']}")
+            self.console.print(f"  API Key Enabled: {state['enable_api_key']}")
+            self.console.print(f"  OAuth Enabled: {state['enable_oauth']}")
+            self.console.print(f"  API Key Present: {state['api_key_present']}")
+            self.console.print(f"  OAuth Authenticated: {state['oauth_authenticated']}")
+            self.console.print(f"  Effective API Key Routing: {state['effective_api_key_enabled']}")
+            self.console.print(f"  Effective OAuth Routing: {state['effective_oauth_enabled']}")
+            self.console.print()
+            self.console.print("[dim]Modes: auto, prefer_api_key, prefer_oauth, api_key_only, oauth_only[/dim]")
+            self.console.print()
+
+        elif subcommand == "mode":
+            mode = parts[1] if len(parts) > 1 else ""
+            if mode not in VALID_OPENAI_AUTH_MODES:
+                self.console.print("[yellow]Usage: /oauth mode <auto|prefer_api_key|prefer_oauth|api_key_only|oauth_only>[/yellow]")
+                self.console.print()
+                return
+
+            if _save_openai_auth_settings_to_settings({"mode": mode}):
+                get_settings().reload()
+                self.console.print(f"[green]✓ OpenAI auth mode set to {mode}[/green]")
+            else:
+                self.console.print("[red]✗ Failed to update auth mode[/red]")
+            self.console.print()
+
+        elif subcommand in {"enable", "disable"}:
+            target = parts[1] if len(parts) > 1 else ""
+            enabled = subcommand == "enable"
+            key_map = {
+                "api-key": "enable_api_key",
+                "apikey": "enable_api_key",
+                "api_key": "enable_api_key",
+                "oauth": "enable_oauth",
+            }
+            setting_key = key_map.get(target)
+            if not setting_key:
+                self.console.print("[yellow]Usage: /oauth enable <api-key|oauth> or /oauth disable <api-key|oauth>[/yellow]")
+                self.console.print()
+                return
+
+            if _save_openai_auth_settings_to_settings({setting_key: enabled}):
+                get_settings().reload()
+                verb = "enabled" if enabled else "disabled"
+                self.console.print(f"[green]✓ {target} {verb} for OpenAI auth routing[/green]")
+            else:
+                self.console.print("[red]✗ Failed to update auth preference[/red]")
+            self.console.print()
+
+        else:
+            self.console.print(f"[red]Unknown subcommand: {subcommand}[/red]")
+            self.console.print("[dim]Use /oauth login, /oauth status, /oauth logout, /oauth import-codex, /oauth prefs, /oauth mode, /oauth enable, or /oauth disable[/dim]")
+            self.console.print()
 
     async def _handle_model_command(self, args: str):
         """Handle /model command - list or set model."""

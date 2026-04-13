@@ -6,8 +6,57 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any, Callable
 
+from pantheon.auth.openai_auth_strategy import (
+    is_api_key_auth_enabled,
+    is_oauth_auth_enabled,
+)
 from .log import logger
 from .misc import run_func
+
+
+def _get_openai_api_key() -> str | None:
+    """Get OpenAI API key from environment.
+    
+    Returns:
+        API key string, or None if not available
+    """
+    import os
+    if not is_api_key_auth_enabled():
+        return None
+    return os.environ.get("OPENAI_API_KEY")
+
+
+def _get_codex_oauth_client_kwargs() -> dict[str, Any] | None:
+    """Return dedicated client kwargs for Codex OAuth transport when available."""
+    if not is_oauth_auth_enabled():
+        return None
+    try:
+        from pantheon.auth.openai_provider import get_openai_oauth_provider
+
+        provider = get_openai_oauth_provider()
+        context = provider.build_codex_auth_context(
+            refresh_if_needed=True,
+            import_codex_if_missing=True,
+        )
+        if not context:
+            return None
+
+        default_headers: dict[str, str] = {}
+        if context.get("account_id"):
+            default_headers["ChatGPT-Account-Id"] = str(context["account_id"])
+        if context.get("organization_id"):
+            default_headers["OpenAI-Organization"] = str(context["organization_id"])
+
+        client_kwargs: dict[str, Any] = {
+            "base_url": str(context["base_url"]),
+            "api_key": str(context["access_token"]),
+        }
+        if default_headers:
+            client_kwargs["default_headers"] = default_headers
+        return client_kwargs
+    except Exception as exc:
+        logger.debug(f"[CODEX_OAUTH] Failed to build Codex OAuth client config: {exc}")
+        return None
 
 _PATTERN_BASE64_DATA_URI = re.compile(
     r"data:image/([a-zA-Z0-9+-]+);base64,([A-Za-z0-9+/=]+)"
@@ -45,11 +94,13 @@ async def acompletion_openai(
 ):
     from openai import NOT_GIVEN, APIConnectionError, AsyncOpenAI
 
+    api_key = _get_openai_api_key()
+    
     # Create client with custom base_url if provided
     if base_url:
-        client = AsyncOpenAI(base_url=base_url)
+        client = AsyncOpenAI(base_url=base_url, api_key=api_key)
     else:
-        client = AsyncOpenAI()
+        client = AsyncOpenAI(api_key=api_key)
     chunks = []
     _tools = tools or NOT_GIVEN
     _pcall = (tools is not None) or NOT_GIVEN
@@ -234,6 +285,7 @@ async def acompletion_responses(
     base_url: str | None = None,
     model_params: dict | None = None,
     num_retries: int = 3,
+    codex_oauth_transport: bool = False,
 ) -> dict:
     """Call OpenAI Responses API with streaming.
 
@@ -245,15 +297,24 @@ async def acompletion_responses(
 
     # ========== Build client ==========
     proxy_kwargs = get_litellm_proxy_kwargs()
+    api_key = _get_openai_api_key()
+    codex_oauth_kwargs = _get_codex_oauth_client_kwargs() if codex_oauth_transport else None
+    
     if proxy_kwargs:
         client = AsyncOpenAI(
             base_url=proxy_kwargs["api_base"],
             api_key=proxy_kwargs["api_key"]
         )
+    elif codex_oauth_kwargs:
+        logger.info(
+            f"[RESPONSES_API] Using Codex OAuth transport | model={model} | "
+            f"base_url={codex_oauth_kwargs['base_url']}"
+        )
+        client = AsyncOpenAI(**codex_oauth_kwargs)
     elif base_url:
-        client = AsyncOpenAI(base_url=base_url)
+        client = AsyncOpenAI(base_url=base_url, api_key=api_key)
     else:
-        client = AsyncOpenAI()
+        client = AsyncOpenAI(api_key=api_key)
 
     # ========== Convert inputs ==========
     instructions, input_items = _convert_messages_to_responses_input(messages)
@@ -266,8 +327,12 @@ async def acompletion_responses(
         "input": input_items,
         "stream": True,
     }
+    if codex_oauth_kwargs:
+        kwargs["store"] = False
     if instructions is not None:
         kwargs["instructions"] = instructions
+    elif codex_oauth_kwargs:
+        kwargs["instructions"] = "You are Codex."
     if converted_tools is not None:
         kwargs["tools"] = converted_tools
     if response_format is not None:
@@ -982,6 +1047,53 @@ class TimingTracker:
             yield
         finally:
             self.end(phase)
+
+
+# ============ LiteLLM Model Cost Map ============
+
+
+async def update_litellm_cost_map(delay: float = 2.0) -> bool:
+    """Fetch the latest litellm model cost/context-window data from GitHub.
+
+    LiteLLM's bundled model registry may not include newer models (e.g. gpt-5.4).
+    This function fetches the latest ``model_prices_and_context_window.json``
+    from the upstream LiteLLM repo and merges it into ``litellm.model_cost``
+    so that ``get_model_info()`` returns accurate ``max_input_tokens`` values.
+
+    Designed to be run as a fire-and-forget background task at startup::
+
+        asyncio.create_task(update_litellm_cost_map())
+
+    Args:
+        delay: Seconds to wait before fetching (lets caller finish init).
+
+    Returns:
+        True if the map was updated successfully, False otherwise.
+    """
+    try:
+        import asyncio
+        await asyncio.sleep(delay)
+
+        import litellm
+        import aiohttp
+
+        url = (
+            "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+            "model_prices_and_context_window.json"
+        )
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    new_map = await response.json(content_type=None)
+                    if new_map:
+                        litellm.model_cost.update(new_map)
+                        logger.info(
+                            f"Updated litellm model cost map ({len(new_map)} models)"
+                        )
+                        return True
+    except Exception:
+        pass  # Best-effort background update
+    return False
 
 
 def _fallback_token_count(text: str) -> int:

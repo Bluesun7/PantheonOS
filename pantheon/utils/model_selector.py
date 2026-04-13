@@ -17,6 +17,7 @@ Usage:
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pantheon.auth.openai_auth_strategy import should_treat_openai_api_key_as_available
 from .log import logger
 
 if TYPE_CHECKING:
@@ -65,12 +66,12 @@ DEFAULT_PROVIDER_PRIORITY = ["openai", "anthropic", "gemini", "zai", "deepseek",
 # Quality levels map to MODEL LISTS (not single models) for fallback chains
 # Models within each level are ordered by preference
 DEFAULT_PROVIDER_MODELS = {
-    # OpenAI: GPT-5.4 series
+    # OpenAI: GPT-4o series
     # https://platform.openai.com/docs/models
     "openai": {
         "high": ["openai/gpt-5.4-pro", "openai/gpt-5.4", "openai/gpt-5.2-pro", "openai/gpt-5.2"],
         "normal": ["openai/gpt-5.4", "openai/gpt-5.2-codex", "openai/gpt-5.2", "openai/gpt-5"],
-        "low": ["openai/gpt-5.4-mini", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/gpt-4.1-mini"],
+        "low": ["openai/gpt-5.4-mini", "openai/gpt-5.4-nano", "openai/gpt-5-mini", "openai/gpt-4.1-mini"],
     },
     # Anthropic: Claude 4.6 series
     # https://docs.anthropic.com/en/docs/about-claude/models/overview
@@ -157,7 +158,7 @@ CAPABILITY_MAP = {
 QUALITY_TAGS = {"high", "normal", "low"}
 
 # Ultimate fallback model when nothing else works (must be concrete model, not tag)
-ULTIMATE_FALLBACK = "openai/gpt-5.4"
+ULTIMATE_FALLBACK = "openai/gpt-4o-mini"
 
 # Recommended fallback tag for general use
 FALLBACK_TAG = "low"
@@ -216,8 +217,14 @@ class ModelSelector:
         self._detected_provider: str | None = None
         self._available_providers: set[str] | None = None
 
+    def _settings_get(self, key: str, default=None):
+        """Read a setting when a Settings object is available."""
+        if self.settings is None:
+            return default
+        return self.settings.get(key, default)
+
     def _get_available_providers(self) -> set[str]:
-        """Get set of providers with valid API keys (cached)."""
+        """Get set of providers with valid API credentials for model calls (cached)."""
         if self._available_providers is not None:
             return self._available_providers
 
@@ -226,6 +233,8 @@ class ModelSelector:
         self._available_providers = set()
 
         for provider, env_key in PROVIDER_API_KEYS.items():
+            if provider == "openai" and not should_treat_openai_api_key_as_available():
+                continue
             api_key_value = os.environ.get(env_key, "")
             if api_key_value:
                 self._available_providers.add(provider)
@@ -238,7 +247,11 @@ class ModelSelector:
         # Universal proxy: LLM_API_KEY makes openai provider available
         # (most third-party proxies are OpenAI-compatible)
         # Note: LLM_API_BASE is deprecated, warn user to use custom endpoints instead
-        if not self._available_providers and os.environ.get("LLM_API_KEY", ""):
+        if (
+            not self._available_providers
+            and should_treat_openai_api_key_as_available()
+            and os.environ.get("LLM_API_KEY", "")
+        ):
             if os.environ.get("LLM_API_BASE", ""):
                 logger.warning(
                     "LLM_API_BASE is deprecated. Consider using CUSTOM_OPENAI_API_BASE or "
@@ -281,7 +294,7 @@ class ModelSelector:
                     return provider_key
 
         # 2. Priority: user config > code defaults
-        priority = self.settings.get(
+        priority = self._settings_get(
             "models.provider_priority", DEFAULT_PROVIDER_PRIORITY
         )
 
@@ -321,7 +334,7 @@ class ModelSelector:
             return {}
 
         # Try user configuration first
-        user_config = self.settings.get(f"models.provider_models.{provider}", {})
+        user_config = self._settings_get(f"models.provider_models.{provider}", {})
 
         # Get code defaults
         default_config = DEFAULT_PROVIDER_MODELS.get(provider, {})
@@ -462,7 +475,7 @@ class ModelSelector:
         if provider in CUSTOM_ENDPOINT_ENVS:
             # Find next available non-custom provider
             available = self._get_available_providers()
-            priority = self.settings.get("models.provider_priority", DEFAULT_PROVIDER_PRIORITY)
+            priority = self._settings_get("models.provider_priority", DEFAULT_PROVIDER_PRIORITY)
             fallback_found = False
             for fallback_provider in priority:
                 if fallback_provider in available and fallback_provider not in CUSTOM_ENDPOINT_ENVS:
@@ -602,7 +615,7 @@ class ModelSelector:
         
         for provider in priority:
             if provider in available:
-                user_config = self.settings.get(f"image_gen_models.{provider}", {})
+                user_config = self._settings_get(f"image_gen_models.{provider}", {})
                 provider_models = user_config or DEFAULT_IMAGE_GEN_MODELS.get(provider, {})
                 models = provider_models.get(quality, [])
                 if models:
@@ -621,7 +634,7 @@ class ModelSelector:
             "detected_provider": self._detected_provider
             or self.detect_available_provider(),
             "available_providers": list(self._get_available_providers()),
-            "priority": self.settings.get(
+            "priority": self._settings_get(
                 "models.provider_priority", DEFAULT_PROVIDER_PRIORITY
             ),
         }
@@ -637,7 +650,7 @@ class ModelSelector:
                 "available_providers": ["openai", "anthropic"],
                 "current_provider": "openai",
                 "models_by_provider": {
-                    "openai": ["openai/gpt-5.4", "openai/gpt-5.2", ...],
+                    "openai": ["openai/gpt-4o", "openai/gpt-4o-mini", ...],
                     "anthropic": ["anthropic/claude-opus-4-5-20251101", ...]
                 },
                 "supported_tags": ["high", "normal", "low", "vision", ...]

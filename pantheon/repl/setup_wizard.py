@@ -17,8 +17,11 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
+from pantheon.auth.oauth_manager import get_oauth_manager
 from pantheon.utils.model_selector import PROVIDER_API_KEYS, CUSTOM_ENDPOINT_ENVS, CustomEndpointConfig
 from pantheon.utils.log import logger
+from pantheon.settings import load_jsonc
+from pantheon.auth.openai_auth_strategy import summarize_openai_auth_state
 
 
 # ============ Data Classes for Better Readability ============
@@ -36,6 +39,7 @@ class ProviderMenuEntry:
 # Providers shown in the wizard/keys menu
 PROVIDER_MENU = [
     ProviderMenuEntry("openai", "OpenAI", "OPENAI_API_KEY"),
+    ProviderMenuEntry("openai_oauth", "OpenAI (OAuth)", None),  # OAuth doesn't require API key
     ProviderMenuEntry("anthropic", "Anthropic", "ANTHROPIC_API_KEY"),
     ProviderMenuEntry("gemini", "Google Gemini", "GEMINI_API_KEY"),
     ProviderMenuEntry("google", "Google AI", "GOOGLE_API_KEY"),
@@ -65,13 +69,45 @@ CUSTOM_ENDPOINT_MENU = [
     for config in CUSTOM_ENDPOINT_ENVS.values()
 ]
 
+
+def _get_openai_oauth_status():
+    try:
+        manager = get_oauth_manager()
+        provider = manager.get_provider("openai")
+        if hasattr(provider, "peek_status"):
+            return provider.peek_status()
+        return manager.get_status("openai")
+    except Exception:
+        return None
+
+
+def get_openai_auth_summary_state() -> dict:
+    oauth_status = _get_openai_oauth_status()
+    return summarize_openai_auth_state(
+        api_key_present=bool(os.environ.get("OPENAI_API_KEY")),
+        oauth_authenticated=bool(oauth_status and oauth_status.authenticated),
+    )
+
+
+def _render_openai_auth_summary(console, title: str = "OpenAI Auth Status", state: dict | None = None):
+    state = state or get_openai_auth_summary_state()
+
+    console.print()
+    console.print(f"[bold]{title}[/bold]")
+    console.print(f"  API Key: {'configured' if state['api_key_present'] else 'not configured'}")
+    console.print(f"  OAuth: {'authenticated' if state['oauth_authenticated'] else 'not authenticated'}")
+    console.print(f"  Mode: {state['mode']}")
+    console.print(
+        f"  Routing: api_key={'on' if state['effective_api_key_enabled'] else 'off'}, "
+        f"oauth={'on' if state['effective_oauth_enabled'] else 'off'}"
+    )
+    console.print()
 def check_and_run_setup():
-    """Check if any LLM provider API keys are set; launch wizard if none found.
+    """Check if any callable LLM provider credentials are set; launch wizard if none found.
 
     Called at startup before the event loop starts (sync context).
     Also checks for universal LLM_API_KEY (custom API endpoint) and
     custom endpoint keys (CUSTOM_*_API_KEY).
-
     Skips the wizard if:
     - Any API key is already configured
     - SKIP_SETUP_WIZARD environment variable is set
@@ -90,6 +126,20 @@ def check_and_run_setup():
         if os.environ.get(config.api_key_env, ""):
             return
 
+    # Check OAuth providers
+    try:
+        oauth_manager = get_oauth_manager()
+        for provider_name in oauth_manager.list_providers():
+            provider = oauth_manager.get_provider(provider_name)
+            if hasattr(provider, "peek_status"):
+                status = provider.peek_status()
+            else:
+                status = oauth_manager.get_status(provider_name)
+            if status and status.authenticated:
+                return
+    except Exception:
+        pass
+
     # Check legacy universal LLM_API_KEY (with deprecation warning)
     if os.environ.get("LLM_API_KEY", ""):
         if os.environ.get("LLM_API_BASE", ""):
@@ -100,7 +150,7 @@ def check_and_run_setup():
             )
         return
 
-    # No API keys found - launch wizard
+    # No API keys or OAuth found - launch wizard
     run_setup_wizard()
 
 
@@ -127,6 +177,7 @@ def run_setup_wizard(standalone: bool = False):
             border_style="cyan",
         )
     )
+    _render_openai_auth_summary(console, "Current OpenAI Auth Status")
 
     configured_any = False
 
@@ -144,8 +195,12 @@ def run_setup_wizard(standalone: bool = False):
         # Show provider menu
         console.print("\nStandard Providers:")
         for i, entry in enumerate(PROVIDER_MENU, 1):
-            already_set = " [green](configured)[/green]" if os.environ.get(entry.env_var, "") else ""
-            console.print(f"  [cyan][{i}][/cyan] {entry.display_name:<20} ({entry.env_var}){already_set}")
+            # Handle OAuth providers which don't have env_var
+            if entry.env_var is None:
+                already_set = ""
+            else:
+                already_set = " [green](configured)[/green]" if os.environ.get(entry.env_var, "") else ""
+            console.print(f"  [cyan][{i}][/cyan] {entry.display_name:<20} ({entry.env_var or 'OAuth'}){already_set}")
         console.print()
         console.print("[dim]  Prefix with 'd' to delete, e.g. d0, d1,d3[/dim]")
         console.print()
@@ -202,8 +257,19 @@ def run_setup_wizard(standalone: bool = False):
 
         for idx in delete_standard_indices:
             entry = PROVIDER_MENU[idx]
-            _remove_key_from_env_file(entry.env_var)
-            console.print(f"[green]\u2713 {entry.display_name} ({entry.env_var}) removed[/green]")
+
+            # Special handling for OAuth providers
+            if entry.provider_key == "openai_oauth":
+                try:
+                    oauth_manager = get_oauth_manager()
+                    oauth_manager.logout("openai")
+                    console.print(f"[green]✓ {entry.display_name} credentials cleared[/green]")
+                except Exception as e:
+                    logger.warning(f"Failed to clear OAuth credentials: {e}")
+                    console.print(f"[yellow]Failed to clear {entry.display_name}: {e}[/yellow]")
+            else:
+                _remove_key_from_env_file(entry.env_var)
+                console.print(f"[green]\u2713 {entry.display_name} ({entry.env_var}) removed[/green]")
 
         if (delete_legacy_custom or delete_custom_indices or delete_standard_indices) and not standard_indices and not custom_indices and not has_legacy_custom:
             console.print()
@@ -303,6 +369,38 @@ def run_setup_wizard(standalone: bool = False):
         # Collect API keys for selected standard providers
         for idx in standard_indices:
             entry = PROVIDER_MENU[idx]
+
+            # Special handling for OAuth providers (no API key needed)
+            if entry.provider_key == "openai_oauth":
+                console.print(f"\n[bold]Configure {entry.display_name}[/bold]")
+                console.print("[dim]A browser window will open so you can authenticate with OpenAI.[/dim]")
+                console.print("[dim]This enables Codex OAuth transport. Standard OpenAI API model calls still require an API key or compatible endpoint.[/dim]")
+
+                try:
+                    oauth_manager = get_oauth_manager()
+                    success = oauth_manager.login("openai")
+
+                    if success:
+                        status = oauth_manager.get_status("openai")
+                        console.print("[green]✓ OpenAI OAuth login successful[/green]")
+                        if status.email:
+                            console.print(f"  Email: {status.email}")
+                        if status.organization_id:
+                            console.print(f"  Organization: {status.organization_id}")
+                        if status.project_id:
+                            console.print(f"  Project: {status.project_id}")
+                        configured_any = True
+                    else:
+                        console.print("[red]✗ OpenAI OAuth login failed[/red]")
+                        console.print("[dim]You can retry later with '/oauth login openai' in the REPL.[/dim]")
+                except (EOFError, KeyboardInterrupt):
+                    console.print("\n[yellow]OAuth login cancelled.[/yellow]")
+                except Exception as e:
+                    logger.warning(f"OpenAI OAuth login from setup wizard failed: {e}")
+                    console.print(f"[red]✗ OpenAI OAuth login error: {e}[/red]")
+                    console.print("[dim]You can retry later with '/oauth login openai' in the REPL.[/dim]")
+                continue
+
             console.print(f"\n[bold]Enter API key for {entry.display_name}[/bold]")
             try:
                 api_key = pt_prompt(f"{entry.env_var}: ", is_password=True)
@@ -330,7 +428,9 @@ def run_setup_wizard(standalone: bool = False):
 
     if configured_any:
         env_path = Path.home() / ".pantheon" / ".env"
-        console.print(f"\n[green]\u2713 API keys saved to {env_path}[/green]")
+        console.print(f"\n[green]\u2713 Provider credentials updated[/green]")
+        console.print(f"[dim]Environment file: {env_path}[/dim]")
+        _render_openai_auth_summary(console, "Final OpenAI Auth Status")
         if not standalone:
             console.print("  Starting Pantheon...\n")
     else:
@@ -492,3 +592,39 @@ def _remove_custom_model_from_settings(provider_key: str):
                 break
     except Exception as e:
         logger.warning(f"Failed to remove custom model from settings.json: {e}")
+
+
+def _ensure_user_settings_file() -> Path | None:
+    settings_path = Path.home() / ".pantheon" / "settings.json"
+    if settings_path.exists():
+        return settings_path
+
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        template = Path(__file__).parent.parent / "factory" / "templates" / "settings.json"
+        if template.exists():
+            shutil.copy(template, settings_path)
+            logger.debug(f"Created {settings_path} from factory template")
+            return settings_path
+    except Exception as e:
+        logger.warning(f"Failed to create user settings.json: {e}")
+    return None
+
+
+def _save_openai_auth_settings_to_settings(updates: dict):
+    """Persist auth.openai preferences to ~/.pantheon/settings.json."""
+    settings_path = _ensure_user_settings_file()
+    if settings_path is None:
+        return False
+
+    try:
+        data = load_jsonc(settings_path)
+        auth = data.setdefault("auth", {})
+        openai = auth.setdefault("openai", {})
+        openai.update(updates)
+        settings_path.write_text(json.dumps(data, indent=4), encoding="utf-8")
+        logger.debug(f"Updated auth.openai settings in {settings_path}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to update auth.openai settings: {e}")
+        return False
